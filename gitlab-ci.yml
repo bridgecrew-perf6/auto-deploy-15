@@ -1,0 +1,199 @@
+# GitLab CI example - .gitlab-ci.yml
+
+image: ubuntu:latest
+
+services:
+  - name: mariadbci:v10.2.15
+    alias: mariadb-ci
+
+variables:
+  MYSQL_DATABASE: "app"
+  MYSQL_USER: "appuser"
+  MYSQL_PASSWORD: "apppass"
+  MYSQL_ROOT_PASSWORD: "root"
+
+stages:
+  - setup
+  - standard
+  - test
+  - release
+  - deploy
+
+cache: &global_cache
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - vendor/
+    - src/Classes/PdoHandler.php
+    - .env.local.php
+    - var/*
+  policy: pull-push
+
+Setup PHP dependencies:
+  stage: setup
+  script:
+    - bash scripts/ci/pdo_handler
+    - composer  self-update
+    - composer install --no-interaction
+    - composer dump-env dev
+    - bash scripts/ci/jwt_generator
+    - git submodule sync --recursive
+    - git submodule update --init --recursive
+  cache:
+    # inherit all global cache settings
+    <<: *global_cache
+    # override the policy
+    policy: push
+  rules:
+    - when: always
+
+Check coding standard:
+  stage: standard
+  cache:
+    # inherit all global cache settings
+    <<: *global_cache
+    # override the policy
+    policy: pull
+  script:
+    - scripts/check_coding_standard
+  rules:
+    - when: always
+
+Unit test:
+  stage: test
+  cache:
+    # inherit all global cache settings
+    <<: *global_cache
+    # override the policy
+    policy: pull
+  script:
+      - php bin/console doctrine:schema:update -f
+      - php bin/console doctrine:schema:update -f --em=qpay
+      - php bin/console doctrine:fixtures:load -n
+      - phpdbg -qrr vendor/bin/phpunit --coverage-text --colors=never
+  rules:
+    - when: always
+
+check TEST ENV CI variables:
+  image: sshpass:1.0.0
+  stage: standard
+  script:
+    - if [[ -z "$DEPLOY_USER" ]]; then echo DEPLOY_USER variable not set && exit 1; fi;
+    - if [[ -z "$DEPLOY_PASSWORD" ]]; then echo DEPLOY_PASSWORD variable not set && exit 1; fi;
+    - if [[ -z "$GL_TOKEN" ]]; then echo GL_TOKEN variable not set && exit 1; fi;
+    - if [[ -z "$DEPLOY_TEST_HOST" ]]; then echo DEPLOY_TEST_HOST variable not set && exit 1; fi;
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "beta" && $CI_PROJECT_NAMESPACE == "project-namespace"'
+  dependencies: []
+
+check PROD ENV CI variables:
+  image: sshpass:1.0.0
+  stage: standard
+  script:
+    - if [[ -z "$GL_TOKEN" ]]; then echo GL_TOKEN variable not set && exit 1; fi;
+    - if [[ -z "$PROD_HOSTS" ]]; then echo PROD_HOSTS variable not set && exit 1; fi;
+    - if [[ -z "$PROD_HOST_PRIVKEY" ]]; then echo PROD_HOST_PRIVKEY variable not set && exit 1; fi;
+    - if [[ -z "$STAGING_HOSTS" ]]; then echo STAGING_HOSTS variable not set && exit 1; fi;
+    - if [[ -z "$STAGING_HOST_PRIVKEY" ]]; then echo STAGING_HOST_PRIVKEY variable not set && exit 1; fi;
+    - if [[ -z "$SENTRY_PROJECT" ]]; then echo SENTRY_PROJECT variable not set && exit 1; fi;
+    - if [[ -z "$SENTRY_URL" ]]; then echo SENTRY_URL variable not set && exit 1; fi;
+    - if [[ -z "$SENTRY_ORG" ]]; then echo SENTRY_ORG variable not set && exit 1; fi;
+    - if [[ -z "$SENTRY_AUTH_TOKEN" ]]; then echo SENTRY_AUTH_TOKEN variable not set && exit 1; fi;
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_PROJECT_NAMESPACE == "project-namespace"'
+  dependencies: []
+
+Deploy Code to TEST:
+  image: sshpass:1.3.0
+  stage: deploy
+  environment:
+    name: TEST
+  script:
+    # Check job permissions
+    - if [[ ! 'nyamjantsan' =~ (^| )$GITLAB_USER_LOGIN($| ) ]]; then echo 'You are not the one who should deploy !' && exit 1; fi
+    # Apply code changes
+    - sshpass -p $DEPLOY_PASSWORD ssh -o "StrictHostKeyChecking=no" $DEPLOY_USER@$DEPLOY_TEST_HOST sudo /opt/deploy/scripts/blue-green-deployment.sh master
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "beta" && $CI_PROJECT_NAMESPACE == "project-namespace"'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+
+Commit format test:
+  image: semantic-release:1.0.1
+  stage: test
+  script:
+    - commitlint --from=$(git describe --tags --abbrev=0)
+  dependencies: []
+  rules:
+    - when: always
+
+Release Tag:
+  image: semantic-release:1.3.0
+  stage: release
+  script:
+    - semantic-release --publish
+    - latest_tag=$(git describe --tags $(git rev-list --tags --max-count=1))
+    - echo $latest_tag >> latest_version
+    - sentry-cli releases new $latest_tag
+    - sentry-cli releases set-commits --auto $latest_tag
+    - sentry-cli releases finalize $latest_tag
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_PROJECT_NAMESPACE == "and/backend"'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+  artifacts:
+    paths:
+      - latest_version
+  dependencies: []
+
+Deploy Code to STAGING:
+  image: sshpass:1.3.0
+  stage: deploy
+  environment:
+    name: STAGING
+    url: https://api2.example.mn/
+  script:
+    # Check job permissions
+    - if [[ ! 'nyamjantsan' =~ (^| )$GITLAB_USER_LOGIN($| ) ]]; then echo 'You are not the one who should deploy !' && exit 1; fi
+    # Check tag version file
+    - if [[ ! -f latest_version ]]; then echo tag not defined && exit 1; fi;
+    - export LATEST_VERSION="$(cat latest_version)"
+    - echo $LATEST_VERSION
+    - mkdir -p /root/.ssh && touch ~/.ssh/known_hosts
+    - chmod 400 $STAGING_HOST_PRIVKEY
+    - for host in ${STAGING_HOSTS[@]}; do echo "###############################################"; echo "Deploying to" $host; echo "###############################################"; ssh-keyscan -t rsa $host >> ~/.ssh/known_hosts; ssh -i $STAGING_HOST_PRIVKEY deploy@$host sudo /opt/deploy/scripts/blue-green-deployment.sh $LATEST_VERSION; done
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_PROJECT_NAMESPACE == "project-namespace"'
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+  dependencies:
+    - Release Tag
+
+Deploy Code to PROD:
+  image: sshpass:1.3.0
+  stage: deploy
+  environment:
+    name: PROD
+    url: https://api.example.mn/
+  script:
+    # Check job permissions
+    - if [[ ! 'nyamjantsan' =~ (^| )$GITLAB_USER_LOGIN($| ) ]]; then echo 'You are not the one who should deploy !' && exit 1; fi
+    # Check tag version file
+    - if [[ ! -f latest_version ]]; then echo tag not defined && exit 1; fi;
+    - export LATEST_VERSION="$(cat latest_version)"
+    - echo $LATEST_VERSION
+    - mkdir -p /root/.ssh && touch ~/.ssh/known_hosts
+    - chmod 400 $PROD_HOST_PRIVKEY
+    - STARTTIME=$(date '+%Y-%m-%dT%H:%M:%S')
+    - for host in ${PROD_HOSTS[@]}; do echo "###############################################"; echo "Deploying to" $host; echo "###############################################"; ssh-keyscan -t rsa $host >> ~/.ssh/known_hosts; ssh -i $PROD_HOST_PRIVKEY deploy@$host sudo /opt/deploy/scripts/blue-green-deployment.sh $LATEST_VERSION; done
+    # Sentry
+    - curl --fail --output "/dev/null" --silent --show-error -X POST -H "Content-Type:application/json" -H "Authorization:Bearer $SENTRY_AUTH_TOKEN" -d "{\"environment\":\"PROD\",\"name\":\"$LATEST_VERSION\",\"dateStarted\":\"$STARTTIME\",\"dateFinished\":\"$(date '+%Y-%m-%dT%H:%M:%S')\"}" "$SENTRY_URL/api/0/organizations/$SENTRY_ORG/releases/$LATEST_VERSION/deploys/"
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "master" && $CI_PROJECT_NAMESPACE == "project-namespace"
+      when: manual
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: never
+  dependencies:
+    - Release Tag
