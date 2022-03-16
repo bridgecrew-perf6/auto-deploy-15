@@ -1,0 +1,2 @@
+# you should add below line in visudo
+deploy ALL=NOPASSWD:/opt/deploy/scripts/blue-green-deployment.sh
